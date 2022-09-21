@@ -71,7 +71,7 @@ jobs:
                 tag_name: "${{ github.ref_name }}",
                 previous_tag_name: "${{ steps.prev-version.outputs.previous-version }}" 
               });
-            console.log(`Generated logs: ${releaseNotes.body}`)
+            console.log(`Generated logs: ${releaseNotes.data.body}`)
             } catch (error) {
               core.setFailed(error.message);
             }
