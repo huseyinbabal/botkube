@@ -15,8 +15,6 @@ const (
 	notifierStopMsgFmt          = "Sure! I won't send you notifications from cluster '%s' here."
 	notifierStatusMsgFmt        = "Notifications from cluster '%s' are %s here."
 	notifierNotConfiguredMsgFmt = "I'm not configured to send notifications here ('%s') from cluster '%s', so you cannot turn them on or off."
-
-	notifierCmdFirstArg = "notifier"
 )
 
 // NotifierHandler handles disabling and enabling notifications for a given communication platform.
@@ -26,6 +24,8 @@ type NotifierHandler interface {
 
 	// SetNotificationsEnabled sets a new notification status for a given conversation ID.
 	SetNotificationsEnabled(conversationID string, enabled bool) error
+
+	BotName() string
 }
 
 var (
@@ -39,31 +39,24 @@ var (
 type NotifierExecutor struct {
 	log               logrus.FieldLogger
 	analyticsReporter AnalyticsReporter
+	cfgManager        ConfigPersistenceManager
 
 	// Used for deprecated showControllerConfig function.
 	cfg config.Config
 }
 
 // NewNotifierExecutor creates a new instance of NotifierExecutor.
-func NewNotifierExecutor(log logrus.FieldLogger, cfg config.Config, analyticsReporter AnalyticsReporter) *NotifierExecutor {
-	return &NotifierExecutor{log: log, cfg: cfg, analyticsReporter: analyticsReporter}
-}
-
-// CanHandle returns true if the arguments can be handled by this executor.
-func (e *NotifierExecutor) CanHandle(args []string) bool {
-	if len(args) == 0 {
-		return false
+func NewNotifierExecutor(log logrus.FieldLogger, cfg config.Config, cfgManager ConfigPersistenceManager, analyticsReporter AnalyticsReporter) *NotifierExecutor {
+	return &NotifierExecutor{
+		log:               log,
+		cfg:               cfg,
+		cfgManager:        cfgManager,
+		analyticsReporter: analyticsReporter,
 	}
-
-	if args[0] != notifierCmdFirstArg {
-		return false
-	}
-
-	return true
 }
 
 // Do executes a given Notifier command based on args.
-func (e *NotifierExecutor) Do(args []string, platform config.CommPlatformIntegration, conversationID string, clusterName string, handler NotifierHandler) (string, error) {
+func (e *NotifierExecutor) Do(args []string, commGroupName string, platform config.CommPlatformIntegration, conversationID string, clusterName string, handler NotifierHandler) (string, error) {
 	if len(args) != 2 {
 		return "", errInvalidNotifierCommand
 	}
@@ -84,24 +77,36 @@ func (e *NotifierExecutor) Do(args []string, platform config.CommPlatformIntegra
 
 	switch NotifierAction(cmdVerb) {
 	case Start:
-		err := handler.SetNotificationsEnabled(conversationID, true)
+		const enabled = true
+		err := handler.SetNotificationsEnabled(conversationID, enabled)
 		if err != nil {
 			if errors.Is(err, ErrNotificationsNotConfigured) {
 				return fmt.Sprintf(notifierNotConfiguredMsgFmt, conversationID, clusterName), nil
 			}
 
-			return "", fmt.Errorf("while setting notifications to true: %w", err)
+			return "", fmt.Errorf("while setting notifications to %t: %w", enabled, err)
+		}
+
+		err = e.cfgManager.PersistNotificationsEnabled(commGroupName, platform, conversationID, enabled)
+		if err != nil {
+			return "", fmt.Errorf("while persisting configuration: %w", err)
 		}
 
 		return fmt.Sprintf(notifierStartMsgFmt, clusterName), nil
 	case Stop:
-		err := handler.SetNotificationsEnabled(conversationID, false)
+		const enabled = false
+		err := handler.SetNotificationsEnabled(conversationID, enabled)
 		if err != nil {
 			if errors.Is(err, ErrNotificationsNotConfigured) {
 				return fmt.Sprintf(notifierNotConfiguredMsgFmt, conversationID, clusterName), nil
 			}
 
-			return "", fmt.Errorf("while setting notifications to false: %w", err)
+			return "", fmt.Errorf("while setting notifications to %t: %w", enabled, err)
+		}
+
+		err = e.cfgManager.PersistNotificationsEnabled(commGroupName, platform, conversationID, enabled)
+		if err != nil {
+			return "", fmt.Errorf("while persisting configuration: %w", err)
 		}
 
 		return fmt.Sprintf(notifierStopMsgFmt, clusterName), nil
@@ -138,6 +143,8 @@ func (e *NotifierExecutor) showControllerConfig() (string, error) {
 	// TODO: avoid printing sensitive data without need to resetting them manually (which is an error-prone approach)
 	for key, old := range cfg.Communications {
 		old.Slack.Token = redactedSecretStr
+		old.Slack.AppToken = redactedSecretStr
+		old.Slack.BotToken = redactedSecretStr
 		old.Elasticsearch.Password = redactedSecretStr
 		old.Discord.Token = redactedSecretStr
 		old.Mattermost.Token = redactedSecretStr

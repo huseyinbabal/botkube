@@ -56,6 +56,18 @@ func NewRouter(mapper meta.RESTMapper, dynamicCli dynamic.Interface, log logrus.
 	}
 }
 
+// AddCommunicationsBindings adds source binding from a given communications
+func (r *Router) AddCommunicationsBindings(c config.Communications) {
+	r.AddAnyBindingsByName(c.Slack.Channels)
+	r.AddAnyBindingsByName(c.Mattermost.Channels)
+	r.AddAnyBindings(c.Teams.Bindings)
+	r.AddAnyBindingsByID(c.Discord.Channels)
+	for _, index := range c.Elasticsearch.Indices {
+		r.AddAnySinkBindings(index.Bindings)
+	}
+	r.AddAnySinkBindings(c.Webhook.Bindings)
+}
+
 // AddAnyBindingsByName adds source binding names
 // to dictate which source bindings the router should use.
 func (r *Router) AddAnyBindingsByName(c config.IdentifiableMap[config.ChannelBindingsByName]) *Router {
@@ -175,7 +187,7 @@ func (r *Router) HandleEvent(ctx context.Context, target config.EventType, handl
 		if !informer.canHandleEvent(target.String()) {
 			continue
 		}
-		sourceRoutes := r.GetSourceRoutes(resource, target)
+		sourceRoutes := r.getSourceRoutes(resource, target)
 		informer.handleEvent(ctx, resource, target, sourceRoutes, handlerFn)
 	}
 }
@@ -189,7 +201,7 @@ func (r *Router) HandleMappedEvent(ctx context.Context, targetEvent config.Event
 }
 
 // GetSourceRoutes returns all routes for a resource and target event
-func (r *Router) GetSourceRoutes(resource string, targetEvent config.EventType) []route {
+func (r *Router) getSourceRoutes(resource string, targetEvent config.EventType) []route {
 	return sourceRoutes(r.table, resource, targetEvent)
 }
 

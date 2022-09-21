@@ -12,6 +12,7 @@ import (
 	"github.com/mattermost/mattermost-server/v6/model"
 	"github.com/sirupsen/logrus"
 
+	"github.com/kubeshop/botkube/pkg/bot/interactive"
 	"github.com/kubeshop/botkube/pkg/config"
 	"github.com/kubeshop/botkube/pkg/events"
 	"github.com/kubeshop/botkube/pkg/execute"
@@ -54,6 +55,7 @@ type Mattermost struct {
 	wsClient        *model.WebSocketClient
 	apiClient       *model.Client4
 	channelsMutex   sync.RWMutex
+	commGroupName   string
 	channels        map[string]channelConfigByID
 	notifyMutex     sync.Mutex
 	botMentionRegex *regexp.Regexp
@@ -72,7 +74,7 @@ type mattermostMessage struct {
 }
 
 // NewMattermost creates a new Mattermost instance.
-func NewMattermost(log logrus.FieldLogger, cfg config.Mattermost, executorFactory ExecutorFactory, reporter AnalyticsReporter) (*Mattermost, error) {
+func NewMattermost(log logrus.FieldLogger, commGroupName string, cfg config.Mattermost, executorFactory ExecutorFactory, reporter AnalyticsReporter) (*Mattermost, error) {
 	botMentionRegex, err := mattermostBotMentionRegex(cfg.BotName)
 	if err != nil {
 		return nil, err
@@ -121,6 +123,7 @@ func NewMattermost(log logrus.FieldLogger, cfg config.Mattermost, executorFactor
 		teamName:        cfg.Team,
 		apiClient:       client,
 		webSocketURL:    webSocketURL,
+		commGroupName:   commGroupName,
 		channels:        channelsByIDCfg,
 		botMentionRegex: botMentionRegex,
 	}, nil
@@ -220,8 +223,9 @@ func (mm *mattermostMessage) handleMessage(b *Mattermost) {
 	channel, exists := b.getChannels()[channelID]
 	mm.IsAuthChannel = exists
 
-	e := mm.executorFactory.NewDefault(b.IntegrationName(), b, mm.IsAuthChannel, channelID, channel.Bindings.Executors, mm.Request)
-	mm.Response = e.Execute()
+	e := mm.executorFactory.NewDefault(b.commGroupName, b.IntegrationName(), b, mm.IsAuthChannel, channelID, channel.Bindings.Executors, mm.Request)
+	out := interactive.MessageToMarkdown(interactive.MDLineFmt, e.Execute())
+	mm.Response = out
 	mm.sendMessage()
 }
 
@@ -369,7 +373,7 @@ func (b *Mattermost) getChannelsToNotify(event events.Event, eventSources []stri
 	for _, cfg := range b.getChannels() {
 		switch {
 		case !cfg.notify:
-			b.log.Info("Skipping notification for channel %q as notifications are disabled.", cfg.Identifier())
+			b.log.Infof("Skipping notification for channel %q as notifications are disabled.", cfg.Identifier())
 		default:
 			if sliceutil.Intersect(eventSources, cfg.Bindings.Sources) {
 				out = append(out, cfg.Identifier())
@@ -380,14 +384,15 @@ func (b *Mattermost) getChannelsToNotify(event events.Event, eventSources []stri
 }
 
 // SendMessage sends message to Mattermost channel
-func (b *Mattermost) SendMessage(_ context.Context, msg string) error {
+func (b *Mattermost) SendMessage(_ context.Context, msg interactive.Message) error {
 	errs := multierror.New()
 	for _, channel := range b.getChannels() {
 		channelID := channel.ID
-		b.log.Debugf("Sending message to channel %q: %+v", channelID, msg)
+		plaintext := interactive.MessageToMarkdown(interactive.MDLineFmt, msg)
+		b.log.Debugf("Sending message to channel %q: %+v", channelID, plaintext)
 		post := &model.Post{
 			ChannelId: channelID,
-			Message:   msg,
+			Message:   plaintext,
 		}
 		if _, _, err := b.apiClient.CreatePost(post); err != nil {
 			errs = multierror.Append(errs, fmt.Errorf("while creating a post: %w", err))
@@ -436,7 +441,7 @@ func mattermostChannelsCfgFrom(client *model.Client4, teamID string, channelsCfg
 				ID:       fetchedChannel.Id,
 				Bindings: channCfg.Bindings,
 			},
-			notify: defaultNotifyValue,
+			notify: !channCfg.Notification.Disabled,
 		}
 	}
 
