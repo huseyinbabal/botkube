@@ -1,0 +1,166 @@
+project_name: botkube
+env:
+  - IMAGE_REGISTRY={{ if index .Env "IMAGE_REGISTRY"  }}{{ .Env.IMAGE_REGISTRY }}{{ else }}ghcr.io{{ end }}
+  - IMAGE_REPOSITORY={{ if index .Env "IMAGE_REPOSITORY"  }}{{ .Env.IMAGE_REPOSITORY }}{{ else }}kubeshop/botkube{{ end }}
+  - TEST_IMAGE_REPOSITORY={{ if index .Env "TEST_IMAGE_REPOSITORY"  }}{{ .Env.TEST_IMAGE_REPOSITORY }}{{ else }}kubeshop/botkube-test{{ end }}
+  - ANALYTICS_API_KEY={{ if index .Env "ANALYTICS_API_KEY"  }}{{ .Env.ANALYTICS_API_KEY }}{{ else }}{{ end }}
+release:
+  github:
+    owner: huseyinbabal
+    name: botkube
+  draft: true
+  name_template: '{{.Tag}}'
+  ids:
+    - botkube
+scoop:
+  name: botkube
+  commit_author:
+    name: goreleaserbot
+    email: bot@goreleaser.com
+  commit_msg_template: Scoop update for {{ .ProjectName }} version {{ .Tag }}
+  goamd64: v1
+builds:
+  - id: botkube
+    goos:
+      - linux
+    goarch:
+      - arm64
+    goarm:
+      - "7"
+    gomips:
+      - hardfloat
+    goamd64:
+      - v1
+    targets:
+      - linux_arm64
+    dir: .
+    main: cmd/botkube/main.go
+    binary: botkube
+    builder: go
+    gobinary: go
+    command: build
+    ldflags:
+      - -s -w -X github.com/kubeshop/botkube/pkg/version.Version={{ .Tag }} -X github.com/kubeshop/botkube/pkg/version.GitCommitID={{ .Commit }} -X github.com/kubeshop/botkube/pkg/version.BuildDate={{ .Date }} -X github.com/kubeshop/botkube/internal/analytics.APIKey={{ .Env.ANALYTICS_API_KEY }}
+    env:
+      - CGO_ENABLED=0
+archives:
+  - id: my-archive
+    builds:
+      - botkube
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}{{ with .Mips }}_{{ . }}{{ end }}{{ if not (eq .Amd64 "v1") }}{{ .Amd64 }}{{ end }}'
+    format: tar.gz
+    files:
+      - src: license*
+      - src: LICENSE*
+      - src: readme*
+      - src: README*
+      - src: changelog*
+      - src: CHANGELOG*
+snapshot:
+  name_template: '{{ .Tag }}'
+checksum:
+  name_template: '{{ .ProjectName }}_{{ .Version }}_checksums.txt'
+  algorithm: sha256
+dockers:
+  - goos: linux
+    goarch: amd64
+    goamd64: v1
+    dockerfile: build/Dockerfile
+    image_templates:
+      - '{{.Env.IMAGE_REGISTRY}}/{{.Env.IMAGE_REPOSITORY}}:{{ .Tag }}-amd64'
+    build_flag_templates:
+      - --platform=linux/amd64
+      - --build-arg=botkube_version={{ .Tag }}
+    use: buildx
+  - goos: linux
+    goarch: arm64
+    goamd64: v1
+    dockerfile: build/Dockerfile
+    image_templates:
+      - '{{.Env.IMAGE_REGISTRY}}/{{.Env.IMAGE_REPOSITORY}}:{{ .Tag }}-arm64'
+    build_flag_templates:
+      - --platform=linux/arm64
+      - --build-arg=botkube_version={{ .Tag }}
+    use: buildx
+  - goos: linux
+    goarch: arm
+    goarm: "7"
+    goamd64: v1
+    dockerfile: build/Dockerfile
+    image_templates:
+      - '{{.Env.IMAGE_REGISTRY}}/{{.Env.IMAGE_REPOSITORY}}:{{ .Tag }}-armv7'
+    build_flag_templates:
+      - --platform=linux/arm
+      - --build-arg=botkube_version={{ .Tag }}
+    use: buildx
+  - ids:
+      - botkube-test
+    goos: linux
+    goarch: amd64
+    goamd64: v1
+    dockerfile: build/test.Dockerfile
+    image_templates:
+      - '{{.Env.IMAGE_REGISTRY}}/{{.Env.TEST_IMAGE_REPOSITORY}}:{{ .Tag }}'
+    build_flag_templates:
+      - --platform=linux/amd64
+      - --build-arg=TEST_NAME=botkube-e2e.test
+    use: buildx
+docker_manifests:
+  - name_template: '{{.Env.IMAGE_REGISTRY}}/{{.Env.IMAGE_REPOSITORY}}:{{ .Tag }}'
+    image_templates:
+      - '{{.Env.IMAGE_REGISTRY}}/{{.Env.IMAGE_REPOSITORY}}:{{ .Tag }}-amd64'
+      - '{{.Env.IMAGE_REGISTRY}}/{{.Env.IMAGE_REPOSITORY}}:{{ .Tag }}-arm64'
+      - '{{.Env.IMAGE_REGISTRY}}/{{.Env.IMAGE_REPOSITORY}}:{{ .Tag }}-armv7'
+    use: docker
+changelog:
+  skip: true
+dist: dist
+env_files:
+  github_token: ~/.config/goreleaser/github_token
+  gitlab_token: ~/.config/goreleaser/gitlab_token
+  gitea_token: ~/.config/goreleaser/gitea_token
+before:
+  hooks:
+    - go mod download
+source:
+  name_template: '{{ .ProjectName }}-{{ .Version }}'
+  format: tar.gz
+gomod:
+  gobinary: go
+announce:
+  twitter:
+    message_template: '{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}'
+  reddit:
+    title_template: '{{ .ProjectName }} {{ .Tag }} is out!'
+    url_template: '{{ .ReleaseURL }}'
+  slack:
+    message_template: '{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}'
+    username: GoReleaser
+  discord:
+    message_template: '{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}'
+    author: GoReleaser
+    color: "3888754"
+    icon_url: https://goreleaser.com/static/avatar.png
+  teams:
+    title_template: '{{ .ProjectName }} {{ .Tag }} is out!'
+    message_template: '{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}'
+    color: '#2D313E'
+    icon_url: https://goreleaser.com/static/avatar.png
+  smtp:
+    subject_template: '{{ .ProjectName }} {{ .Tag }} is out!'
+    body_template: 'You can view details from: {{ .ReleaseURL }}'
+  mattermost:
+    message_template: '{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}'
+    title_template: '{{ .ProjectName }} {{ .Tag }} is out!'
+    username: GoReleaser
+  linkedin:
+    message_template: '{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}'
+  telegram:
+    message_template: '{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}'
+  webhook:
+    message_template: '{ "message": "{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}"}'
+    content_type: application/json; charset=utf-8
+github_urls:
+  download: https://github.com
+gitlab_urls:
+  download: https://gitlab.com
