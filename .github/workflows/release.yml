@@ -71,14 +71,19 @@ jobs:
                 tag_name: "${{ github.ref_name }}",
                 previous_tag_name: "${{ steps.prev-version.outputs.previous-version }}" 
               });
-              await github.rest.repos.createRelease({
+              const release = await github.rest.repos.getReleaseByTag({
+                tag: "${{ github.ref_name }}",
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+              });
+              await github.rest.repos.updateRelease({
+                release_id: release.data.id,
                 draft: false,
                 name: "${{ github.ref_name }}",
                 owner: context.repo.owner,
                 prerelease: true,
                 repo: context.repo.repo,
                 tag_name: "${{ github.ref_name }}",
-                previous_tag_name: "${{ steps.prev-version.outputs.previous-version }}",
                 body: releaseNotes.data.body
               });
             } catch (error) {
