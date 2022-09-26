@@ -25,10 +25,12 @@ var defaultConfiguration []byte
 var configPathsFlag []string
 
 const (
-	configEnvVariablePrefix = "BOTKUBE_"
-	configDelimiter         = "."
-	camelCaseDelimiter      = "__"
-	nestedFieldDelimiter    = "_"
+	configEnvVariablePrefix            = "BOTKUBE_"
+	configDelimiter                    = "."
+	camelCaseDelimiter                 = "__"
+	nestedFieldDelimiter               = "_"
+	specialConfigFileNamePrefix        = "_"
+	specialIgnoredConfigFileNamePrefix = "__"
 )
 
 const (
@@ -81,6 +83,9 @@ const (
 	// SlackCommPlatformIntegration defines Slack integration.
 	SlackCommPlatformIntegration CommPlatformIntegration = "slack"
 
+	// SocketSlackCommPlatformIntegration defines Slack integration.
+	SocketSlackCommPlatformIntegration CommPlatformIntegration = "socketSlack"
+
 	// MattermostCommPlatformIntegration defines Mattermost integration.
 	MattermostCommPlatformIntegration CommPlatformIntegration = "mattermost"
 
@@ -122,7 +127,8 @@ const (
 type Config struct {
 	Sources        map[string]Sources        `yaml:"sources" validate:"dive"`
 	Executors      map[string]Executors      `yaml:"executors" validate:"dive"`
-	Communications map[string]Communications `yaml:"communications"  validate:"required,min=1"`
+	Communications map[string]Communications `yaml:"communications"  validate:"required,min=1,dive"`
+	Filters        Filters                   `yaml:"filters"`
 
 	Analytics Analytics `yaml:"analytics"`
 	Settings  Settings  `yaml:"settings"`
@@ -130,8 +136,9 @@ type Config struct {
 
 // ChannelBindingsByName contains configuration bindings per channel.
 type ChannelBindingsByName struct {
-	Name     string      `yaml:"name"`
-	Bindings BotBindings `yaml:"bindings"`
+	Name         string              `yaml:"name"`
+	Notification ChannelNotification `yaml:"notification"` // TODO: rename to `notifications` later
+	Bindings     BotBindings         `yaml:"bindings"`
 }
 
 // Identifier returns ChannelBindingsByID identifier.
@@ -141,8 +148,9 @@ func (c ChannelBindingsByName) Identifier() string {
 
 // ChannelBindingsByID contains configuration bindings per channel.
 type ChannelBindingsByID struct {
-	ID       string      `yaml:"id"`
-	Bindings BotBindings `yaml:"bindings"`
+	ID           string              `yaml:"id"`
+	Notification ChannelNotification `yaml:"notification"` // TODO: rename to `notifications` later
+	Bindings     BotBindings         `yaml:"bindings"`
 }
 
 // Identifier returns ChannelBindingsByID identifier.
@@ -163,28 +171,34 @@ type SinkBindings struct {
 
 // Sources contains configuration for BotKube app sources.
 type Sources struct {
-	Kubernetes KubernetesSource `yaml:"kubernetes"`
+	DisplayName string           `yaml:"displayName"`
+	Kubernetes  KubernetesSource `yaml:"kubernetes"`
 }
 
 // KubernetesSource contains configuration for Kubernetes sources.
 type KubernetesSource struct {
-	Recommendations Recommendations     `yaml:"recommendations"`
-	Resources       KubernetesResources `yaml:"resources" validate:"dive"`
-	Namespaces      Namespaces          `yaml:"namespaces"`
+	Recommendations Recommendations          `yaml:"recommendations"`
+	Events          KubernetesResourceEvents `yaml:"events"`
+	Resources       []Resource               `yaml:"resources" validate:"dive"`
+	Namespaces      Namespaces               `yaml:"namespaces"`
 }
 
-// KubernetesResources contains configuration for Kubernetes resources.
-type KubernetesResources []Resource
-
 // IsAllowed checks if a given resource event is allowed according to the configuration.
-func (r *KubernetesResources) IsAllowed(resourceName, namespace string, eventType EventType) bool {
-	if r == nil || len(*r) == 0 {
+func (r *KubernetesSource) IsAllowed(resourceName, namespace string, eventType EventType) bool {
+	if r == nil || len(r.Resources) == 0 {
 		return false
 	}
 
-	for _, resource := range *r {
+	isEventAllowed := func(resourceEvents KubernetesResourceEvents) bool {
+		if len(resourceEvents) > 0 { // if resource overrides the global events, use them
+			return resourceEvents.Contains(eventType)
+		}
+		return r.Events.Contains(eventType) // check global events
+	}
+
+	for _, resource := range r.Resources {
 		if resource.Name == resourceName &&
-			resource.Events.Contains(eventType) &&
+			isEventAllowed(resource.Events) &&
 			resource.Namespaces.IsAllowed(namespace) {
 			return true
 		}
@@ -220,6 +234,35 @@ type IngressRecommendations struct {
 // Executors contains executors configuration parameters.
 type Executors struct {
 	Kubectl Kubectl `yaml:"kubectl"`
+}
+
+// Filters contains configuration for built-in filters.
+type Filters struct {
+	Kubernetes KubernetesFilters `yaml:"kubernetes"`
+}
+
+// KubernetesFilters contains configuration for Kubernetes-related filters.
+type KubernetesFilters struct {
+	// ObjectAnnotationChecker enables support for `botkube.io/disable` and `botkube.io/channel` resource annotations.
+	ObjectAnnotationChecker bool `yaml:"objectAnnotationChecker"`
+
+	// NodeEventsChecker filters out Node-related events that are not important.
+	NodeEventsChecker bool `yaml:"nodeEventsChecker"`
+}
+
+// SetEnabled enables or disables a given filter.
+func (f *KubernetesFilters) SetEnabled(name string, enabled bool) error {
+	if name == "ObjectAnnotationChecker" {
+		f.ObjectAnnotationChecker = enabled
+		return nil
+	}
+
+	if name == "NodeEventsChecker" {
+		f.NodeEventsChecker = enabled
+		return nil
+	}
+
+	return fmt.Errorf("Filter with name %q not found", name)
 }
 
 // Analytics contains configuration parameters for analytics collection.
@@ -337,9 +380,15 @@ type Notification struct {
 	Type NotificationType
 }
 
-// Communications channels to send events to
+// ChannelNotification contains notification configuration for a given platform.
+type ChannelNotification struct {
+	Disabled bool `yaml:"disabled"`
+}
+
+// Communications contains communication platforms that are supported.
 type Communications struct {
 	Slack         Slack         `yaml:"slack"`
+	SocketSlack   SocketSlack   `yaml:"socketSlack"`
 	Mattermost    Mattermost    `yaml:"mattermost"`
 	Discord       Discord       `yaml:"discord"`
 	Teams         Teams         `yaml:"teams"`
@@ -350,9 +399,18 @@ type Communications struct {
 // Slack configuration to authentication and send notifications
 type Slack struct {
 	Enabled      bool                                   `yaml:"enabled"`
-	Channels     IdentifiableMap[ChannelBindingsByName] `yaml:"channels"  validate:"required,eq=1"`
+	Channels     IdentifiableMap[ChannelBindingsByName] `yaml:"channels"  validate:"required_if=Enabled true,omitempty,min=1"`
 	Notification Notification                           `yaml:"notification,omitempty"`
 	Token        string                                 `yaml:"token,omitempty"`
+}
+
+// SocketSlack configuration to authentication and send notifications
+type SocketSlack struct {
+	Enabled      bool                                   `yaml:"enabled"`
+	Channels     IdentifiableMap[ChannelBindingsByName] `yaml:"channels"  validate:"required_if=Enabled true,omitempty,min=1"`
+	Notification Notification                           `yaml:"notification,omitempty"`
+	BotToken     string                                 `yaml:"botToken,omitempty"`
+	AppToken     string                                 `yaml:"appToken,omitempty"`
 }
 
 // Elasticsearch config auth settings
@@ -363,7 +421,7 @@ type Elasticsearch struct {
 	Server        string              `yaml:"server"`
 	SkipTLSVerify bool                `yaml:"skipTLSVerify"`
 	AWSSigning    AWSSigning          `yaml:"awsSigning"`
-	Indices       map[string]ELSIndex `yaml:"indices"  validate:"required,eq=1"`
+	Indices       map[string]ELSIndex `yaml:"indices"  validate:"required_if=Enabled true,omitempty,min=1"`
 }
 
 // AWSSigning contains AWS configurations
@@ -390,7 +448,7 @@ type Mattermost struct {
 	URL          string                                 `yaml:"url"`
 	Token        string                                 `yaml:"token"`
 	Team         string                                 `yaml:"team"`
-	Channels     IdentifiableMap[ChannelBindingsByName] `yaml:"channels"  validate:"required,eq=1"`
+	Channels     IdentifiableMap[ChannelBindingsByName] `yaml:"channels"  validate:"required_if=Enabled true,omitempty,min=1"`
 	Notification Notification                           `yaml:"notification,omitempty"`
 }
 
@@ -413,7 +471,7 @@ type Discord struct {
 	Enabled      bool                                 `yaml:"enabled"`
 	Token        string                               `yaml:"token"`
 	BotID        string                               `yaml:"botID"`
-	Channels     IdentifiableMap[ChannelBindingsByID] `yaml:"channels"  validate:"required,eq=1"`
+	Channels     IdentifiableMap[ChannelBindingsByID] `yaml:"channels"  validate:"required_if=Enabled true,omitempty,min=1"`
 	Notification Notification                         `yaml:"notification,omitempty"`
 }
 
@@ -442,17 +500,36 @@ type Commands struct {
 
 // Settings contains BotKube's related configuration.
 type Settings struct {
-	ClusterName     string `yaml:"clusterName"`
-	ConfigWatcher   bool   `yaml:"configWatcher"`
-	UpgradeNotifier bool   `yaml:"upgradeNotifier"`
-
-	MetricsPort string `yaml:"metricsPort"`
-	Log         struct {
+	ClusterName      string           `yaml:"clusterName"`
+	ConfigWatcher    bool             `yaml:"configWatcher"`
+	UpgradeNotifier  bool             `yaml:"upgradeNotifier"`
+	SystemConfigMap  K8sConfigMapRef  `yaml:"systemConfigMap"`
+	PersistentConfig PersistentConfig `yaml:"persistentConfig"`
+	MetricsPort      string           `yaml:"metricsPort"`
+	Log              struct {
 		Level         string `yaml:"level"`
 		DisableColors bool   `yaml:"disableColors"`
 	} `yaml:"log"`
 	InformersResyncPeriod time.Duration `yaml:"informersResyncPeriod"`
 	Kubeconfig            string        `yaml:"kubeconfig"`
+}
+
+// PersistentConfig contains configuration for persistent storage.
+type PersistentConfig struct {
+	Startup PartialPersistentConfig `yaml:"startup"`
+	Runtime PartialPersistentConfig `yaml:"runtime"`
+}
+
+// PartialPersistentConfig contains configuration for persistent storage of a given type.
+type PartialPersistentConfig struct {
+	FileName  string          `yaml:"fileName"`
+	ConfigMap K8sConfigMapRef `yaml:"configMap"`
+}
+
+// K8sConfigMapRef holds the configuration for a ConfigMap.
+type K8sConfigMapRef struct {
+	Name      string `yaml:"name,omitempty"`
+	Namespace string `yaml:"namespace,omitempty"`
 }
 
 func (eventType EventType) String() string {
@@ -464,8 +541,8 @@ type PathsGetter func() []string
 
 // LoadWithDefaultsDetails holds the LoadWithDefaults function details.
 type LoadWithDefaultsDetails struct {
-	LoadedCfgFilesPaths []string
-	ValidateWarnings    error
+	CfgFilesToWatch  []string
+	ValidateWarnings error
 }
 
 // LoadWithDefaults loads new configuration from files and environment variables.
@@ -479,6 +556,7 @@ func LoadWithDefaults(getCfgPaths PathsGetter) (*Config, LoadWithDefaultsDetails
 	}
 
 	// merge with user conf files
+	configPaths = sortCfgFiles(configPaths)
 	for _, path := range configPaths {
 		if err := k.Load(file.Provider(filepath.Clean(path)), koanfyaml.Parser()); err != nil {
 			return nil, LoadWithDefaultsDetails{}, err
@@ -510,8 +588,8 @@ func LoadWithDefaults(getCfgPaths PathsGetter) (*Config, LoadWithDefaultsDetails
 	}
 
 	return &cfg, LoadWithDefaultsDetails{
-		LoadedCfgFilesPaths: configPaths,
-		ValidateWarnings:    result.Warnings.ErrorOrNil(),
+		CfgFilesToWatch:  getCfgFilesToWatch(configPaths),
+		ValidateWarnings: result.Warnings.ErrorOrNil(),
 	}, nil
 }
 
@@ -546,6 +624,40 @@ func normalizeConfigEnvName(name string) string {
 	}
 
 	return strings.ReplaceAll(buff.String(), nestedFieldDelimiter, configDelimiter)
+}
+
+// sortCfgFiles sorts the config files so that the files that has specialConfigFileNamePrefix are moved to the end of the slice.
+func sortCfgFiles(paths []string) []string {
+	var ordinaryCfgFiles []string
+	var specialCfgFiles []string
+	for _, path := range paths {
+		_, filename := filepath.Split(path)
+
+		if strings.HasPrefix(filename, specialConfigFileNamePrefix) {
+			specialCfgFiles = append(specialCfgFiles, path)
+			continue
+		}
+
+		ordinaryCfgFiles = append(ordinaryCfgFiles, path)
+	}
+
+	return append(ordinaryCfgFiles, specialCfgFiles...)
+}
+
+// getCfgFilesToWatch excludes the files that has specialIgnoredConfigFileNamePrefix from the paths.
+func getCfgFilesToWatch(paths []string) []string {
+	var filesToWatch []string
+	for _, path := range paths {
+		_, filename := filepath.Split(path)
+
+		if strings.HasPrefix(filename, specialIgnoredConfigFileNamePrefix) {
+			continue
+		}
+
+		filesToWatch = append(filesToWatch, path)
+	}
+
+	return filesToWatch
 }
 
 // IdentifiableMap provides an option to construct an indexable map for identifiable items.

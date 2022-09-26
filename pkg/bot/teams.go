@@ -16,9 +16,10 @@ import (
 	"github.com/infracloudio/msbotbuilder-go/schema"
 	"github.com/sirupsen/logrus"
 
+	"github.com/kubeshop/botkube/pkg/bot/interactive"
 	"github.com/kubeshop/botkube/pkg/config"
 	"github.com/kubeshop/botkube/pkg/events"
-	"github.com/kubeshop/botkube/pkg/format"
+	"github.com/kubeshop/botkube/pkg/execute"
 	"github.com/kubeshop/botkube/pkg/httpsrv"
 	"github.com/kubeshop/botkube/pkg/multierror"
 	"github.com/kubeshop/botkube/pkg/sliceutil"
@@ -49,6 +50,9 @@ var _ Bot = &Teams{}
 
 const teamsBotMentionPrefixFmt = "^<at>%s</at>"
 
+// mdEmojiTag finds the emoji tags
+var mdEmojiTag = regexp.MustCompile(`:(\w+):`)
+
 type conversation struct {
 	ref    schema.ConversationReference
 	notify bool
@@ -63,11 +67,13 @@ type Teams struct {
 	//channels map[string][ChannelBindingsByName]
 	bindings           config.BotBindings
 	conversationsMutex sync.RWMutex
+	commGroupName      string
 	conversations      map[string]conversation
 	notifyMutex        sync.Mutex
 	botMentionRegex    *regexp.Regexp
+	mdFormatter        interactive.MDFormatter
 
-	BotName      string
+	botName      string
 	AppID        string
 	AppPassword  string
 	MessagePath  string
@@ -82,7 +88,7 @@ type consentContext struct {
 }
 
 // NewTeams creates a new Teams instance.
-func NewTeams(log logrus.FieldLogger, cfg config.Teams, clusterName string, executorFactory ExecutorFactory, reporter AnalyticsReporter) (*Teams, error) {
+func NewTeams(log logrus.FieldLogger, commGroupName string, cfg config.Teams, clusterName string, executorFactory ExecutorFactory, reporter AnalyticsReporter) (*Teams, error) {
 	botMentionRegex, err := teamsBotMentionRegex(cfg.BotName)
 	if err != nil {
 		return nil, err
@@ -96,20 +102,23 @@ func NewTeams(log logrus.FieldLogger, cfg config.Teams, clusterName string, exec
 	if msgPath == "" {
 		msgPath = "/"
 	}
+	mdFormatter := interactive.NewMDFormatter(mdLineFormatter, interactive.DefaultMDHeaderFormatter)
 	return &Teams{
 		log:             log,
 		executorFactory: executorFactory,
 		reporter:        reporter,
-		BotName:         cfg.BotName,
+		botName:         cfg.BotName,
 		ClusterName:     clusterName,
 		AppID:           cfg.AppID,
 		AppPassword:     cfg.AppPassword,
 		Notification:    cfg.Notification,
 		bindings:        cfg.Bindings,
+		commGroupName:   commGroupName,
 		MessagePath:     msgPath,
 		Port:            port,
 		conversations:   make(map[string]conversation),
 		botMentionRegex: botMentionRegex,
+		mdFormatter:     mdFormatter,
 	}, nil
 }
 
@@ -225,15 +234,8 @@ func (b *Teams) processActivity(w http.ResponseWriter, req *http.Request) {
 				return schema.Activity{}, fmt.Errorf("while unmarshalling activity context: %w", err)
 			}
 
-			msgWithoutPrefix := b.trimBotMention(consentCtx.Command)
-
-			ref, err := b.getConversationReferenceFrom(activity)
-			if err != nil {
-				return schema.Activity{}, fmt.Errorf("while getting conversation reference: %w", err)
-			}
-
-			e := b.executorFactory.NewDefault(b.IntegrationName(), newTeamsNotifMgrForActivity(b, ref), true, activity.ChannelID, b.bindings.Executors, msgWithoutPrefix)
-			out := e.Execute()
+			activity.Text = consentCtx.Command
+			resp := b.processMessage(activity)
 
 			actJSON, err := json.MarshalIndent(turn.Activity, "", "  ")
 			if err != nil {
@@ -242,7 +244,7 @@ func (b *Teams) processActivity(w http.ResponseWriter, req *http.Request) {
 			b.log.Debugf("Incoming MSTeams Activity: %s", actJSON)
 
 			// upload file
-			err = b.putRequest(uploadInfo.UploadURL, []byte(out))
+			err = b.putRequest(uploadInfo.UploadURL, []byte(resp))
 			if err != nil {
 				return schema.Activity{}, fmt.Errorf("while uploading file: %w", err)
 			}
@@ -278,8 +280,28 @@ func (b *Teams) processMessage(activity schema.Activity) string {
 		return ""
 	}
 
-	e := b.executorFactory.NewDefault(b.IntegrationName(), newTeamsNotifMgrForActivity(b, ref), true, ref.ChannelID, b.bindings.Executors, trimmedMsg)
-	return format.CodeBlock(e.Execute())
+	e := b.executorFactory.NewDefault(execute.NewDefaultInput{
+		CommGroupName:   b.commGroupName,
+		Platform:        b.IntegrationName(),
+		NotifierHandler: newTeamsNotifMgrForActivity(b, ref),
+		Conversation: execute.Conversation{
+			Alias:            "",
+			IsAuthenticated:  true,
+			ID:               ref.ChannelID,
+			ExecutorBindings: b.bindings.Executors,
+		},
+		Message: trimmedMsg,
+	})
+	return b.convertInteractiveMessage(e.Execute())
+}
+
+func (b *Teams) convertInteractiveMessage(in interactive.Message) string {
+	if in.HasSections() {
+		// MS Teams doesn't respect multiple new lines, so it needs to be rendered
+		// with `<br>` tags instead  ¯\_(ツ)_/¯
+		return interactive.MessageToMarkdown(b.mdFormatter, in)
+	}
+	return interactive.MessageToMarkdown(b.mdFormatter, in)
 }
 
 func (b *Teams) putRequest(u string, data []byte) (err error) {
@@ -314,7 +336,7 @@ func (b *Teams) putRequest(u string, data []byte) (err error) {
 
 // SendEvent sends event message via Bot interface
 func (b *Teams) SendEvent(ctx context.Context, event events.Event, eventSources []string) error {
-	b.log.Debugf(">> Sending to Teams: %+v", event)
+	b.log.Debugf("Sending to Teams: %+v", event)
 	card := b.formatMessage(event, b.Notification)
 
 	if !sliceutil.Intersect(eventSources, b.bindings.Sources) {
@@ -340,16 +362,17 @@ func (b *Teams) SendEvent(ctx context.Context, event events.Event, eventSources 
 	return errs.ErrorOrNil()
 }
 
-// SendMessage sends message to MsTeams
-func (b *Teams) SendMessage(ctx context.Context, msg string) error {
+// SendMessage sends message to MS Teams.
+func (b *Teams) SendMessage(ctx context.Context, msg interactive.Message) error {
 	errs := multierror.New()
 	for _, convCfg := range b.getConversations() {
 		channelID := convCfg.ref.ChannelID
 
-		b.log.Debugf(">> Sending message to channel %q: %+v", channelID, msg)
+		plaintext := b.convertInteractiveMessage(msg)
+		b.log.Debugf("Sending message to channel %q: %+v", channelID, plaintext)
 		err := b.Adapter.ProactiveMessage(ctx, convCfg.ref, coreActivity.HandlerFuncs{
 			OnMessageFunc: func(turn *coreActivity.TurnContext) (schema.Activity, error) {
-				return turn.SendActivity(coreActivity.MsgOptionText(msg))
+				return turn.SendActivity(coreActivity.MsgOptionText(plaintext))
 			},
 		})
 		if err != nil {
@@ -404,6 +427,11 @@ func (b *Teams) SetNotificationsEnabled(enabled bool, ref schema.ConversationRef
 	b.setConversations(conversations)
 
 	return nil
+}
+
+// BotName returns the Bot name.
+func (b *Teams) BotName() string {
+	return fmt.Sprintf("@%s", b.botName)
 }
 
 func (b *Teams) sendProactiveMessage(ctx context.Context, convRef schema.ConversationReference, card map[string]interface{}) error {
@@ -494,11 +522,36 @@ func (n *teamsNotificationManager) SetNotificationsEnabled(_ string, enabled boo
 	return n.b.SetNotificationsEnabled(enabled, n.ref)
 }
 
-func teamsBotMentionRegex(BotName string) (*regexp.Regexp, error) {
-	botMentionRegex, err := regexp.Compile(fmt.Sprintf(teamsBotMentionPrefixFmt, BotName))
+// BotName returns the Bot name.
+func (n *teamsNotificationManager) BotName() string {
+	return n.b.BotName()
+}
+
+func teamsBotMentionRegex(botName string) (*regexp.Regexp, error) {
+	botMentionRegex, err := regexp.Compile(fmt.Sprintf(teamsBotMentionPrefixFmt, botName))
 	if err != nil {
 		return nil, fmt.Errorf("while compiling bot mention regex: %w", err)
 	}
 
 	return botMentionRegex, nil
+}
+
+// MSTeamsLineFmt represents new line formatting for MS Teams.
+// Unfortunately, it's different from all others integrations.
+func mdLineFormatter(msg string) string {
+	// e.g. `:rocket:` is not supported by MS Teams, so we need to replace it with actual emoji
+	msg = replaceEmojiTagsWithActualOne(msg)
+	return fmt.Sprintf("%s<br>", msg)
+}
+
+// replaceEmojiTagsWithActualOne replaces the emoji tag with actual emoji.
+func replaceEmojiTagsWithActualOne(content string) string {
+	return mdEmojiTag.ReplaceAllStringFunc(content, func(s string) string {
+		return emojiMapping[s]
+	})
+}
+
+// emojiMapping holds mapping between emoji tags and actual ones.
+var emojiMapping = map[string]string{
+	":rocket:": "🚀",
 }

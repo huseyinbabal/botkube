@@ -10,16 +10,15 @@ import (
 	"github.com/bwmarrin/discordgo"
 	"github.com/sirupsen/logrus"
 
+	"github.com/kubeshop/botkube/pkg/bot/interactive"
 	"github.com/kubeshop/botkube/pkg/config"
 	"github.com/kubeshop/botkube/pkg/events"
 	"github.com/kubeshop/botkube/pkg/execute"
-	"github.com/kubeshop/botkube/pkg/format"
 	"github.com/kubeshop/botkube/pkg/multierror"
 	"github.com/kubeshop/botkube/pkg/sliceutil"
 )
 
 // TODO: Refactor this file as a part of https://github.com/kubeshop/botkube/issues/667
-//    - handle and send methods from `discordMessage` should be defined on Bot level,
 //    - split to multiple files in a separate package,
 //    - review all the methods and see if they can be simplified.
 
@@ -54,22 +53,17 @@ type Discord struct {
 	channels        map[string]channelConfigByID
 	notifyMutex     sync.Mutex
 	botMentionRegex *regexp.Regexp
+	commGroupName   string
+	mdFormatter     interactive.MDFormatter
 }
 
 // discordMessage contains message details to execute command and send back the result.
 type discordMessage struct {
-	log             logrus.FieldLogger
-	executorFactory ExecutorFactory
-
-	Event         *discordgo.MessageCreate
-	Request       string
-	Response      string
-	IsAuthChannel bool
-	Session       *discordgo.Session
+	Event *discordgo.MessageCreate
 }
 
 // NewDiscord creates a new Discord instance.
-func NewDiscord(log logrus.FieldLogger, cfg config.Discord, executorFactory ExecutorFactory, reporter AnalyticsReporter) (*Discord, error) {
+func NewDiscord(log logrus.FieldLogger, commGroupName string, cfg config.Discord, executorFactory ExecutorFactory, reporter AnalyticsReporter) (*Discord, error) {
 	botMentionRegex, err := discordBotMentionRegex(cfg.BotID)
 	if err != nil {
 		return nil, err
@@ -89,8 +83,10 @@ func NewDiscord(log logrus.FieldLogger, cfg config.Discord, executorFactory Exec
 		api:             api,
 		botID:           cfg.BotID,
 		notification:    cfg.Notification,
+		commGroupName:   commGroupName,
 		channels:        channelsCfg,
 		botMentionRegex: botMentionRegex,
+		mdFormatter:     interactive.DefaultMDFormatter(),
 	}, nil
 }
 
@@ -100,14 +96,12 @@ func (b *Discord) Start(ctx context.Context) error {
 
 	// Register the messageCreate func as a callback for MessageCreate events.
 	b.api.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
-		dm := discordMessage{
-			log:             b.log,
-			executorFactory: b.executorFactory,
-			Event:           m,
-			Session:         s,
+		msg := discordMessage{
+			Event: m,
 		}
-
-		dm.HandleMessage(b)
+		if err := b.handleMessage(msg); err != nil {
+			b.log.Errorf("Message handling error: %s", err.Error())
+		}
 	})
 
 	// Open a websocket connection to Discord and begin listening.
@@ -136,7 +130,7 @@ func (b *Discord) Start(ctx context.Context) error {
 // SendEvent sends event notification to Discord ChannelID.
 // Context is not supported by client: See https://github.com/bwmarrin/discordgo/issues/752.
 func (b *Discord) SendEvent(_ context.Context, event events.Event, eventSources []string) (err error) {
-	b.log.Debugf(">> Sending to Discord: %+v", event)
+	b.log.Debugf("Sending to Discord: %+v", event)
 
 	msgToSend := b.formatMessage(event)
 
@@ -154,14 +148,16 @@ func (b *Discord) SendEvent(_ context.Context, event events.Event, eventSources 
 	return errs.ErrorOrNil()
 }
 
-// SendMessage sends message to Discord channel.
+// SendMessage sends interactive message to Discord channel.
 // Context is not supported by client: See https://github.com/bwmarrin/discordgo/issues/752.
-func (b *Discord) SendMessage(_ context.Context, msg string) error {
+func (b *Discord) SendMessage(_ context.Context, msg interactive.Message) error {
 	errs := multierror.New()
 	for _, channel := range b.getChannels() {
 		channelID := channel.ID
-		b.log.Debugf(">> Sending message to channel %q: %+v", channelID, msg)
-		if _, err := b.api.ChannelMessageSend(channelID, msg); err != nil {
+		plaintext := interactive.MessageToMarkdown(b.mdFormatter, msg)
+		b.log.Debugf("Sending message to channel %q: %s", channelID, plaintext)
+
+		if _, err := b.api.ChannelMessageSend(channelID, plaintext); err != nil {
 			errs = multierror.Append(errs, fmt.Errorf("while sending Discord message to channel %q: %w", channelID, err))
 			continue
 		}
@@ -187,7 +183,7 @@ func (b *Discord) getChannelsToNotify(eventSources []string) []string {
 	for _, cfg := range b.getChannels() {
 		switch {
 		case !cfg.notify:
-			b.log.Info("Skipping notification for channel %q as notifications are disabled.", cfg.Identifier())
+			b.log.Infof("Skipping notification for channel %q as notifications are disabled.", cfg.Identifier())
 		default:
 			if sliceutil.Intersect(eventSources, cfg.Bindings.Sources) {
 				out = append(out, cfg.Identifier())
@@ -227,53 +223,78 @@ func (b *Discord) SetNotificationsEnabled(channelID string, enabled bool) error 
 }
 
 // HandleMessage handles the incoming messages.
-func (dm *discordMessage) HandleMessage(b *Discord) {
+func (b *Discord) handleMessage(dm discordMessage) error {
 	// Handle message only if starts with mention
-	trimmedMsg, found := b.findAndTrimBotMention(dm.Event.Content)
+	req, found := b.findAndTrimBotMention(dm.Event.Content)
 	if !found {
 		b.log.Debugf("Ignoring message as it doesn't contain %q mention", b.botID)
-		return
+		return nil
 	}
-	dm.Request = trimmedMsg
 
-	channel, exists := b.getChannels()[dm.Event.ChannelID]
-	dm.IsAuthChannel = exists
+	channel, isAuthChannel := b.getChannels()[dm.Event.ChannelID]
 
-	e := dm.executorFactory.NewDefault(b.IntegrationName(), b, dm.IsAuthChannel, channel.Identifier(), channel.Bindings.Executors, dm.Request)
+	e := b.executorFactory.NewDefault(execute.NewDefaultInput{
+		CommGroupName:   b.commGroupName,
+		Platform:        b.IntegrationName(),
+		NotifierHandler: b,
+		Conversation: execute.Conversation{
+			Alias:            channel.alias,
+			ID:               channel.Identifier(),
+			ExecutorBindings: channel.Bindings.Executors,
+			IsAuthenticated:  isAuthChannel,
+		},
+		Message: req,
+		User:    fmt.Sprintf("<@%s>", dm.Event.Author.ID),
+	})
 
-	dm.Response = e.Execute()
-	dm.Send()
+	out := e.Execute()
+	resp := interactive.MessageToMarkdown(b.mdFormatter, out)
+	err := b.send(dm.Event, req, resp)
+	if err != nil {
+		return fmt.Errorf("while sending message: %w", err)
+	}
+
+	return nil
 }
 
-func (dm *discordMessage) Send() {
-	dm.log.Debugf("Discord incoming Request: %s", dm.Request)
-	dm.log.Debugf("Discord Response: %s", dm.Response)
+func (b *Discord) send(event *discordgo.MessageCreate, req, resp string) error {
+	b.log.Debugf("Discord incoming Request: %s", req)
+	b.log.Debugf("Discord Response: %s", resp)
 
-	if len(dm.Response) == 0 {
-		dm.log.Errorf("Invalid request. Dumping the response. Request: %s", dm.Request)
-		return
+	if len(resp) == 0 {
+		return fmt.Errorf("while reading Slack response: empty response for request %q", req)
 	}
 
 	// Upload message as a file if too long
-	if len(dm.Response) >= 2000 {
+	if len(resp) >= 2000 {
 		params := &discordgo.MessageSend{
-			Content: dm.Request,
+			Content: req,
 			Files: []*discordgo.File{
 				{
 					Name:   "Response",
-					Reader: strings.NewReader(dm.Response),
+					Reader: strings.NewReader(resp),
 				},
 			},
 		}
-		if _, err := dm.Session.ChannelMessageSendComplex(dm.Event.ChannelID, params); err != nil {
-			dm.log.Error("Error in uploading file:", err)
+		if _, err := b.api.ChannelMessageSendComplex(event.ChannelID, params); err != nil {
+			return fmt.Errorf("while uploading file: %w", err)
 		}
-		return
+		return nil
 	}
 
-	if _, err := dm.Session.ChannelMessageSend(dm.Event.ChannelID, format.CodeBlock(dm.Response)); err != nil {
-		dm.log.Error("Error in sending message:", err)
+	if _, err := b.api.ChannelMessageSend(event.ChannelID, resp); err != nil {
+		return fmt.Errorf("while sending message: %w", err)
 	}
+	return nil
+}
+
+// BotName returns the Bot name.
+func (b *Discord) BotName() string {
+	// Note: we can use the botID, but it's not rendered well.
+	// We would need to execute external call to find the Bot display name.
+	// But this will be solved once we will introduce full support
+	// for interactive messages.
+	return "@BotKube"
 }
 
 func (b *Discord) getChannels() map[string]channelConfigByID {
@@ -298,10 +319,11 @@ func (b *Discord) findAndTrimBotMention(msg string) (string, bool) {
 
 func discordChannelsConfigFrom(channelsCfg config.IdentifiableMap[config.ChannelBindingsByID]) map[string]channelConfigByID {
 	res := make(map[string]channelConfigByID)
-	for _, channCfg := range channelsCfg {
+	for channAlias, channCfg := range channelsCfg {
 		res[channCfg.Identifier()] = channelConfigByID{
 			ChannelBindingsByID: channCfg,
-			notify:              defaultNotifyValue,
+			alias:               channAlias,
+			notify:              !channCfg.Notification.Disabled,
 		}
 	}
 

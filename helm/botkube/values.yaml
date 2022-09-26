@@ -17,7 +17,7 @@ image:
   # -- BotKube container image pull policy.
   pullPolicy: IfNotPresent
   # -- BotKube container image tag. Default tag is `appVersion` from Chart.yaml.
-  tag: v9.99.9-dev
+  tag: v0.30.0-rc.1
 
 # -- Configures Pod Security Policy to allow BotKube to run in restricted clusters.
 # [Ref doc](https://kubernetes.io/docs/concepts/policy/pod-security-policy/).
@@ -58,8 +58,8 @@ kubeconfig:
 #
 ## Format: sources.<alias>
 sources:
-  'k8s-events':
-
+  'k8s-recommendation-events':
+    displayName: "Kubernetes Recommendations"
     # -- Describes Kubernetes source configuration.
     kubernetes:
       # -- Describes configuration for various recommendation insights.
@@ -77,10 +77,14 @@ sources:
           # -- If true, notifies about Ingress resources with invalid TLS secret reference.
           tlsSecretValid: true
 
+  'k8s-all-events':
+    displayName: "Kubernetes Info"
+    # -- Describes Kubernetes source configuration.
+    kubernetes:
       # -- Describes namespaces for every Kubernetes resources you want to watch or exclude.
       # These namespaces are applied to every resource specified in the resources list.
       # However, every specified resource can override this by using its own namespaces object.
-      namespaces:
+      namespaces: &k8s-events-namespaces
         # Include contains a list of allowed Namespaces.
         # It can also contain a regex expressions:
         #  `- ".*"` - to specify all Namespaces.
@@ -91,8 +95,16 @@ sources:
         #  `- "test-.*"` - to specif all Namespaces with `test-` prefix.
         # exclude: []
 
+      # -- Describes events for every Kubernetes resources you want to watch or exclude.
+      # These events are applied to every resource specified in the resources list.
+      # However, every specified resource can override this by using its own events object.
+      events:
+        - create
+        - delete
+        - error
+
       # -- Describes the Kubernetes resources you want to watch.
-      # @default -- Watch all built-in K8s kinds.
+      # @default -- See the `values.yaml` file for full object.
       resources:
         - name: v1/pods             # Name of the resource. Resource name must be in group/version/resource (G/V/R) format
                                     # resource name should be plural (e.g apps/v1/deployments, v1/pods)
@@ -101,69 +113,19 @@ sources:
         #    include:
         #      - ".*"
         #    exclude: []
-          events:                   # List of lifecycle events you want to receive, e.g create, update, delete, error OR all
-            - create
-            - delete
-            - error
         - name: v1/services
-          events:
-            - create
-            - delete
-            - error
-        - name: apps/v1/deployments
-          events:
-            - create
-            - update
-            - delete
-            - error
-          updateSetting:
-            includeDiff: true
-            fields:
-              - spec.template.spec.containers[*].image
-              - status.availableReplicas
-        - name: apps/v1/statefulsets
-          events:
-            - create
-            - update
-            - delete
-            - error
-          updateSetting:
-            includeDiff: true
-            fields:
-              - spec.template.spec.containers[*].image
-              - status.readyReplicas
         - name: networking.k8s.io/v1/ingresses
-          events:
-            - create
-            - delete
-            - error
         - name: v1/nodes
-          events:
-            - create
-            - delete
-            - error
         - name: v1/namespaces
-          events:
-            - create
-            - delete
-            - error
         - name: v1/persistentvolumes
-          events:
-            - create
-            - delete
-            - error
         - name: v1/persistentvolumeclaims
-          events:
-            - create
-            - delete
-            - error
         - name: v1/configmaps
-          events:
-            - create
-            - delete
-            - error
+        - name: rbac.authorization.k8s.io/v1/roles
+        - name: rbac.authorization.k8s.io/v1/rolebindings
+        - name: rbac.authorization.k8s.io/v1/clusterrolebindings
+        - name: rbac.authorization.k8s.io/v1/clusterroles
         - name: apps/v1/daemonsets
-          events:
+          events: # Overrides 'source'.kubernetes.events
             - create
             - update
             - delete
@@ -174,7 +136,7 @@ sources:
               - spec.template.spec.containers[*].image
               - status.numberReady
         - name: batch/v1/jobs
-          events:
+          events: # Overrides 'source'.kubernetes.events
             - create
             - update
             - delete
@@ -184,26 +146,28 @@ sources:
             fields:
               - spec.template.spec.containers[*].image
               - status.conditions[*].type
-        - name: rbac.authorization.k8s.io/v1/roles
-          events:
+        - name: apps/v1/deployments
+          events: # Overrides 'source'.kubernetes.events
             - create
+            - update
             - delete
             - error
-        - name: rbac.authorization.k8s.io/v1/rolebindings
-          events:
+          updateSetting:
+            includeDiff: true
+            fields:
+              - spec.template.spec.containers[*].image
+              - status.availableReplicas
+        - name: apps/v1/statefulsets
+          events: # Overrides 'source'.kubernetes.events
             - create
+            - update
             - delete
             - error
-        - name: rbac.authorization.k8s.io/v1/clusterrolebindings
-          events:
-            - create
-            - delete
-            - error
-        - name: rbac.authorization.k8s.io/v1/clusterroles
-          events:
-            - create
-            - delete
-            - error
+          updateSetting:
+            includeDiff: true
+            fields:
+              - spec.template.spec.containers[*].image
+              - status.readyReplicas
        ## Custom resource example
        # - name: velero.io/v1/backups
        #   namespaces:
@@ -220,6 +184,53 @@ sources:
        #     includeDiff: true
        #     fields:
        #       - status.phase
+
+  'k8s-err-events':
+    displayName: "Kubernetes Errors"
+
+    # -- Describes Kubernetes source configuration.
+    kubernetes:
+      # -- Describes namespaces for every Kubernetes resources you want to watch or exclude.
+      # These namespaces are applied to every resource specified in the resources list.
+      # However, every specified resource can override this by using its own namespaces object.
+      namespaces: *k8s-events-namespaces
+
+      # -- Describes events for every Kubernetes resources you want to watch or exclude.
+      # These events are applied to every resource specified in the resources list.
+      # However, every specified resource can override this by using its own events object.
+      events:
+        - error
+
+      # -- Describes the Kubernetes resources you want to watch.
+      # @default -- See the `values.yaml` file for full object.
+      resources:
+        - name: v1/pods
+        - name: v1/services
+        - name: networking.k8s.io/v1/ingresses
+        - name: v1/nodes
+        - name: v1/namespaces
+        - name: v1/persistentvolumes
+        - name: v1/persistentvolumeclaims
+        - name: v1/configmaps
+        - name: rbac.authorization.k8s.io/v1/roles
+        - name: rbac.authorization.k8s.io/v1/rolebindings
+        - name: rbac.authorization.k8s.io/v1/clusterrolebindings
+        - name: rbac.authorization.k8s.io/v1/clusterroles
+        - name: apps/v1/deployments
+        - name: apps/v1/statefulsets
+        - name: apps/v1/daemonsets
+        - name: batch/v1/jobs
+
+# -- Filter settings for various sources.
+# Currently, all filters are globally enabled or disabled.
+# You can enable or disable filters with `@BotKube filters` commands.
+# @default -- See the `values.yaml` file for full object.
+filters:
+  kubernetes:
+    # -- If true, enables support for `botkube.io/disable` and `botkube.io/channel` resource annotations.
+    objectAnnotationChecker: true
+    # -- If true, filters out Node-related events that are not important.
+    nodeEventsChecker: true
 
 # -- Map of executors. Executor contains configuration for running `kubectl` commands.
 # The property name under `executors` is an alias for a given configuration. You can define multiple executor configurations with different names.
@@ -282,19 +293,51 @@ communications:
         'default':
           # -- Slack channel name without '#' prefix where you have added BotKube and want to receive notifications in.
           name: 'SLACK_CHANNEL'
+          notification:
+            # -- If true, the notifications are not sent to the channel. They can be enabled with `@BotKube` command anytime.
+            disabled: false
           bindings:
             # -- Executors configuration for a given channel.
             executors:
               - kubectl-read-only
             # -- Notification sources configuration for a given channel.
             sources:
-              - k8s-events
+              - k8s-err-events
+              - k8s-recommendation-events
       # -- Slack token.
-      token: 'SLACK_API_TOKEN'
+      token: ''
       notification:
         # -- Configures notification type that are sent. Possible values: `short`, `long`.
         type: short
 
+    ## Settings for Slack with Socket Mode.
+    socketSlack:
+      # -- If true, enables Slack bot.
+      enabled: false
+      # -- Map of configured channels. The property name under `channels` object is an alias for a given configuration.
+      #
+      ## Format: channels.<alias>
+      channels:
+        'default':
+          # -- Slack channel name without '#' prefix where you have added BotKube and want to receive notifications in.
+          name: 'SLACK_CHANNEL'
+          bindings:
+            # -- Executors configuration for a given channel.
+            executors:
+              - kubectl-read-only
+            # -- Notification sources configuration for a given channel.
+            sources:
+              - k8s-err-events
+              - k8s-recommendation-events
+      # -- Slack bot token for your own Slack app.
+      # [Ref doc](https://api.slack.com/authentication/token-types).
+      botToken: ''
+      # -- Slack app-level token for your own Slack app.
+      # [Ref doc](https://api.slack.com/authentication/token-types).
+      appToken: ''
+      notification:
+        # -- Configures notification type that are sent. Possible values: `short`, `long`.
+        type: short
     ## Settings for Mattermost.
     mattermost:
       # -- If true, enables Mattermost bot.
@@ -315,13 +358,17 @@ communications:
           # -- The Mattermost channel name for receiving BotKube alerts.
           # The BotKube user needs to be added to it.
           name: 'MATTERMOST_CHANNEL'
+          notification:
+            # -- If true, the notifications are not sent to the channel. They can be enabled with `@BotKube` command anytime.
+            disabled: false
           bindings:
             # -- Executors configuration for a given channel.
             executors:
               - kubectl-read-only
             # -- Notification sources configuration for a given channel.
             sources:
-              - k8s-events
+              - k8s-err-events
+              - k8s-recommendation-events
       notification:
         # -- Configures notification type that are sent. Possible values: `short`, `long`.
         type: short
@@ -342,12 +389,10 @@ communications:
           - kubectl-read-only
         # -- Source bindings apply to all channels which have notification turned on with `@BotKube notifier start` command.
         sources:
-          - k8s-events
+          - k8s-err-events
+          - k8s-recommendation-events
       # -- The path in endpoint URL provided while registering BotKube to MS Teams.
       messagePath: "/bots/teams"
-      notification:
-        # -- Configures notification type that are sent. Possible values: `short`, `long`.
-        type: short
       # -- The Service port for bot endpoint on BotKube container.
       port: 3978
 
@@ -367,13 +412,17 @@ communications:
           # -- Discord channel ID for receiving BotKube alerts.
           # The BotKube user needs to be added to it.
           id: 'DISCORD_CHANNEL_ID'
+          notification:
+            # -- If true, the notifications are not sent to the channel. They can be enabled with `@BotKube` command anytime.
+            disabled: false
           bindings:
             # -- Executors configuration for a given channel.
             executors:
               - kubectl-read-only
             # -- Notification sources configuration for a given channel.
             sources:
-              - k8s-events
+              - k8s-err-events
+              - k8s-recommendation-events
       notification:
         # -- Configures notification type that are sent. Possible values: `short`, `long`.
         type: short
@@ -412,7 +461,8 @@ communications:
           bindings:
             # -- Notification sources configuration for a given index.
             sources:
-              - k8s-events
+              - k8s-err-events
+              - k8s-recommendation-events
 
     ## Settings for Webhook.
     webhook:
@@ -423,7 +473,8 @@ communications:
       bindings:
         # -- Notification sources configuration for the webhook.
         sources:
-          - k8s-events
+          - k8s-err-events
+          - k8s-recommendation-events
 
 ## Global BotKube configuration.
 settings:
@@ -439,6 +490,24 @@ settings:
     level: info
     # -- If true, disable ANSI colors in logging.
     disableColors: false
+
+  # -- BotKube's system ConfigMap where internal data is stored.
+  systemConfigMap:
+    name: botkube-system
+
+  # -- Persistent config contains ConfigMap where persisted configuration is stored.
+  # The persistent configuration is evaluated from both chart upgrade and BotKube commands used in runtime.
+  persistentConfig:
+    startup:
+      configMap:
+        name: botkube-startup-config
+        annotations: {}
+      fileName: "__startup_state.yaml"
+    runtime:
+      configMap:
+        name: botkube-runtime-config
+        annotations: {}
+      fileName: "_runtime_state.yaml"
 
 ## For using custom SSL certificates.
 ssl:
@@ -631,7 +700,7 @@ e2eTest:
     # -- Test runner image pull policy.
     pullPolicy: IfNotPresent
     # -- Test runner image tag. Default tag is `appVersion` from Chart.yaml.
-    tag: v9.99.9-dev
+    tag: v0.30.0-rc.1
   # -- Configures BotKube Deployment related data.
   deployment:
     waitTimeout: 3m
@@ -642,6 +711,19 @@ e2eTest:
     # -- Name of the BotKube Tester bot that sends messages during the e2e tests.
     testerName: "botkube_tester"
     # -- Slack tester application token that interacts with BotKube bot.
+    testerAppToken: ""
+    # -- Additional message that is sent by Tester. You can pass e.g. pull request number or source link where these tests are run from.
+    additionalContextMessage: ""
+    # -- Message wait timeout. It defines how long we wait to ensure that notification were not sent when disabled.
+    messageWaitTimeout: 1m
+  discord:
+    # -- Name of the BotKube bot to interact with during the e2e tests.
+    botName: "botkube"
+    # -- Name of the BotKube Tester bot that sends messages during the e2e tests.
+    testerName: "botkube_tester"
+    # -- Discord Guild ID (discord server ID) used to run e2e tests
+    guildID: ""
+    # -- Discord tester application token that interacts with BotKube bot.
     testerAppToken: ""
     # -- Additional message that is sent by Tester. You can pass e.g. pull request number or source link where these tests are run from.
     additionalContextMessage: ""

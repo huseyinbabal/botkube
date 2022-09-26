@@ -8,20 +8,16 @@ import (
 	"github.com/kubeshop/botkube/pkg/execute"
 )
 
-const (
-	defaultNotifyValue = true
-)
-
 // Bot connects to communication channels and reads/sends messages. It is a two-way integration.
 type Bot interface {
 	Start(ctx context.Context) error
-	IntegrationName() config.CommPlatformIntegration
+	BotName() string
 	controller.Notifier
 }
 
 // ExecutorFactory facilitates creation of execute.Executor instances.
 type ExecutorFactory interface {
-	NewDefault(platform config.CommPlatformIntegration, notifierHandler execute.NotifierHandler, isAuthChannel bool, conversationID string, bindings []string, message string) execute.Executor
+	NewDefault(cfg execute.NewDefaultInput) execute.Executor
 }
 
 // AnalyticsReporter defines a reporter that collects analytics data.
@@ -44,11 +40,13 @@ type FatalErrorAnalyticsReporter interface {
 type channelConfigByID struct {
 	config.ChannelBindingsByID
 
+	alias  string
 	notify bool
 }
 
 type channelConfigByName struct {
 	config.ChannelBindingsByName
 
+	alias  string
 	notify bool
 }
