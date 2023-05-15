@@ -9,11 +9,5 @@ LABEL org.opencontainers.image.source="git@github.com:kubeshop/botkube.git" \
 
 COPY botkube /usr/local/bin/botkube
 
-# Create Non Privileged user
-RUN addgroup --gid 1001 botkube && \
-    adduser -S --uid 1001 --ingroup botkube botkube
-
-# Run as Non Privileged user
-USER botkube
 
 ENTRYPOINT /usr/local/bin/botkube

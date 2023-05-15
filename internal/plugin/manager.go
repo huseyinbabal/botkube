@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/hashicorp/go-getter"
 	"github.com/hashicorp/go-plugin"
@@ -195,7 +197,7 @@ func (m *Manager) loadPlugins(ctx context.Context, pluginType Type, pluginsToEna
 			ver = latestPluginInfo.Version
 		}
 
-		binPath := filepath.Join(m.cfg.CacheDir, repoName, fmt.Sprintf("%s_%s_%s", pluginType, ver, pluginName))
+		binPath := filepath.Join(m.cfg.CacheDir, repoName, pluginName, fmt.Sprintf("%s_%s_%s", pluginType, ver, pluginName))
 		log := m.log.WithFields(logrus.Fields{
 			"plugin":  pluginKey,
 			"version": ver,
@@ -370,8 +372,12 @@ func createGRPCClients[C any](logger logrus.FieldLogger, bins map[string]string,
 }
 
 func newPluginOSRunCommand(path string) *exec.Cmd {
-	cmd := exec.Command(path)
-
+	dir, file := filepath.Split(path)
+	cmd := exec.Command("./" + file)
+	cmd.Dir = "/"
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Chroot: dir,
+	}
 	// Set env with path to dependencies
 	//
 	// Unfortunately, we cannot override PATH env variable when creating a plugin client.
@@ -386,8 +392,34 @@ func newPluginOSRunCommand(path string) *exec.Cmd {
 	if found {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("KUBECONFIG=%s", val))
 	}
-
+	s, _ := json.MarshalIndent(cmd, "", "\t")
+	fmt.Print(string(s))
 	return cmd
+}
+
+func copy(src, dst string) (int64, error) {
+	sourceFileStat, err := os.Stat(src)
+	if err != nil {
+		return 0, err
+	}
+
+	if !sourceFileStat.Mode().IsRegular() {
+		return 0, fmt.Errorf("%s is not a regular file", src)
+	}
+
+	source, err := os.Open(src)
+	if err != nil {
+		return 0, err
+	}
+	defer source.Close()
+
+	destination, err := os.Create(dst)
+	if err != nil {
+		return 0, err
+	}
+	defer destination.Close()
+	nBytes, err := io.Copy(destination, source)
+	return nBytes, err
 }
 
 func (m *Manager) ensurePluginDownloaded(ctx context.Context, binPath string, info storeEntry) error {
